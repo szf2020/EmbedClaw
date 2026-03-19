@@ -12,6 +12,7 @@
 /* ==================== [Includes] ========================================== */
 
 #include "ec_agent.h"
+#include "ec_channel.h"
 #include "ec_config_internal.h"
 #include "llm/ec_llm.h"
 
@@ -29,12 +30,18 @@
 
 /* ==================== [Defines] =========================================== */
 
-#define TOOL_RESULT_MAX_FOR_LLM 4096
+#define EC_AGENT_TOOL_RESULT_MAX_FOR_LLM 4096
 
-#define EC_TOOL_OUTPUT_SIZE  (4 * 1024)
+#define EC_AGENT_TOOL_OUTPUT_SIZE  (4 * 1024)
 #define EC_AGENT_PROMPT_SCRATCH_SIZE 4096
+#define EC_AGENT_SESSION_KEY_MAX (sizeof(((ec_msg_t *)0)->channel) + \
+                            sizeof(((ec_msg_t *)0)->chat_type) + \
+                            sizeof(((ec_msg_t *)0)->chat_id) + 3)
 
-#define AGENT_SYSTEM_PROMPT_STR \
+#define EC_AGENT_CHANNEL_DELIVERY_TASK_STACK (8 * 1024)
+#define EC_AGENT_CHANNEL_DELIVERY_TASK_PRIO  5
+
+#define EC_AGENT_SYSTEM_PROMPT_STR \
         "You are EmbedClaw, a helpful and concise AI assistant running on an ESP32 device.\n"\
         "You communicate via Feishu and WebSocket.\n"\
         "Reply briefly to short messages (e.g. 你好, 在吗, 谢谢).\n"\
@@ -48,7 +55,7 @@
         "- cron_add: schedule task.\n"\
         "- cron_list: list tasks.\n"\
         "- cron_remove: remove task.\n\n"\
-        "When using cron_add for feishu delivery, always set channel='feishu' and a valid numeric chat_id.\n\n"\
+        "When using cron_add to reply later in the same conversation, reuse the current channel, chat_type, and chat_id.\n\n"\
         "Use tools when needed. Provide your final answer as text after using tools.\n\n"\
         "## Memory\n"\
         "You have persistent memory stored on local flash:\n"\
@@ -71,6 +78,7 @@
 /* ==================== [Static Prototypes] ================================= */
 
 static void agent_loop_task(void *arg);
+static void channel_delivery_task(void *arg);
 
 /* ==================== [Static Variables] ================================== */
 
@@ -84,8 +92,8 @@ static QueueHandle_t s_outbound_queue;
 
 esp_err_t ec_agent_start(void)
 {
-    s_inbound_queue = xQueueCreate(EC_BUS_QUEUE_LEN, sizeof(ec_msg_t));
-    s_outbound_queue = xQueueCreate(EC_BUS_QUEUE_LEN, sizeof(ec_msg_t));
+    s_inbound_queue = xQueueCreate(EC_AGENT_BUS_QUEUE_LEN, sizeof(ec_msg_t));
+    s_outbound_queue = xQueueCreate(EC_AGENT_BUS_QUEUE_LEN, sizeof(ec_msg_t));
 
     if (!s_inbound_queue || !s_outbound_queue) {
         ESP_LOGE(TAG, "Failed to create message queues");
@@ -97,11 +105,19 @@ esp_err_t ec_agent_start(void)
                          EC_AGENT_STACK, NULL,
                          EC_AGENT_PRIO, NULL, EC_AGENT_CORE);
 
-    if (ret == pdPASS) {
-        return ESP_OK;
+    if (ret != pdPASS) {
+        return ESP_FAIL;
     }
 
-    return ESP_FAIL;
+    ret = xTaskCreate(channel_delivery_task, "channel_delivery",
+                      EC_AGENT_CHANNEL_DELIVERY_TASK_STACK, NULL,
+                      EC_AGENT_CHANNEL_DELIVERY_TASK_PRIO, NULL);
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "channel delivery task create failed");
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
 }
 
 esp_err_t ec_agent_inbound(const ec_msg_t *msg)
@@ -109,15 +125,6 @@ esp_err_t ec_agent_inbound(const ec_msg_t *msg)
     if (xQueueSend(s_inbound_queue, msg, pdMS_TO_TICKS(1000)) != pdTRUE) {
         ESP_LOGW(TAG, "Inbound queue full, dropping message");
         return ESP_ERR_NO_MEM;
-    }
-    return ESP_OK;
-}
-
-esp_err_t ec_agent_outbound(ec_msg_t *msg, uint32_t timeout_ms)
-{
-    TickType_t ticks = (timeout_ms == UINT32_MAX) ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
-    if (xQueueReceive(s_outbound_queue, msg, ticks) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
     }
     return ESP_OK;
 }
@@ -167,6 +174,23 @@ static void json_set_string(cJSON *obj, const char *key, const char *value)
     cJSON_AddStringToObject(obj, key, value);
 }
 
+static void build_session_key(const ec_msg_t *msg, char *buf, size_t size)
+{
+    if (!buf || size == 0) {
+        return;
+    }
+
+    if (!msg) {
+        buf[0] = '\0';
+        return;
+    }
+
+    snprintf(buf, size, "%s|%s|%s",
+             msg->channel[0] ? msg->channel : "",
+             msg->chat_type[0] ? msg->chat_type : "",
+             msg->chat_id[0] ? msg->chat_id : "");
+}
+
 static char *patch_tool_input_with_context(const ec_llm_tool_call_t *call, const ec_msg_t *msg)
 {
     if (!call || !msg || strcmp(call->name, "cron_add") != 0) {
@@ -193,12 +217,21 @@ static char *patch_tool_input_with_context(const ec_llm_tool_call_t *call, const
         changed = true;
     }
 
-    if (channel && strcmp(channel, EC_CHAN_FEISHU) == 0 &&
-            strcmp(msg->channel, EC_CHAN_FEISHU) == 0 && msg->chat_id[0] != '\0') {
+    if (channel && strcmp(channel, g_ec_channel_system) != 0 &&
+            strcmp(channel, msg->channel) == 0) {
         cJSON *chat_item = cJSON_GetObjectItem(root, "chat_id");
         const char *chat_id = cJSON_IsString(chat_item) ? chat_item->valuestring : NULL;
-        if (!chat_id || chat_id[0] == '\0' || strcmp(chat_id, "cron") == 0) {
+        if (msg->chat_id[0] != '\0' &&
+                (!chat_id || chat_id[0] == '\0' || strcmp(chat_id, "cron") == 0)) {
             json_set_string(root, "chat_id", msg->chat_id);
+            changed = true;
+        }
+
+        chat_item = cJSON_GetObjectItem(root, "chat_type");
+        const char *chat_type = cJSON_IsString(chat_item) ? chat_item->valuestring : NULL;
+        if (msg->chat_type[0] != '\0' &&
+                (!chat_type || chat_type[0] == '\0' || strcmp(chat_type, "cron") == 0)) {
+            json_set_string(root, "chat_type", msg->chat_type);
             changed = true;
         }
     }
@@ -207,7 +240,8 @@ static char *patch_tool_input_with_context(const ec_llm_tool_call_t *call, const
     if (changed) {
         patched = cJSON_PrintUnformatted(root);
         if (patched) {
-            ESP_LOGI(TAG, "Patched cron_add target to %s:%s", msg->channel, msg->chat_id);
+            ESP_LOGI(TAG, "Patched cron_add target to %s:%s:%s", msg->channel, msg->chat_type, msg->chat_id);
+            ESP_LOGI(TAG, "cron_add patched input: %.200s", patched);
         }
     }
 
@@ -228,12 +262,19 @@ static cJSON *build_tool_results(const ec_llm_response_t *resp, const ec_msg_t *
             tool_input = patched_input;
         }
 
+        if (strcmp(call->name, "cron_add") == 0) {
+            ESP_LOGI(TAG, "Tool cron_add input: %.200s", tool_input ? tool_input : "(null)");
+        }
+
         /* Execute tool */
         tool_output[0] = '\0';
         ec_tools_execute(call->name, tool_input, tool_output, tool_output_size);
         free(patched_input);
 
         ESP_LOGI(TAG, "Tool %s result: %d bytes", call->name, (int)strlen(tool_output));
+        if (strcmp(call->name, "cron_add") == 0) {
+            ESP_LOGI(TAG, "Tool cron_add output: %.200s", tool_output);
+        }
 
         /* Build tool_result block */
         cJSON *result_block = cJSON_CreateObject();
@@ -287,7 +328,7 @@ static esp_err_t context_build_system_prompt(char *buf, size_t size)
     size_t off = 0;
     size_t cap = size - 1;
 
-    off += snprintf(buf + off, size - off, AGENT_SYSTEM_PROMPT_STR);
+    off += snprintf(buf + off, size - off, EC_AGENT_SYSTEM_PROMPT_STR);
     if (off > cap) {
         off = cap;
     }
@@ -357,10 +398,12 @@ static void append_turn_context_prompt(char *prompt, size_t size, const ec_msg_t
                 "\n## Current Turn Context\n"
                 "- source_channel: %s\n"
                 "- source_chat_id: %s\n"
-                "- If using cron_add for feishu in this turn, set channel='feishu' and chat_id to source_chat_id.\n"
-                "- Never use chat_id 'cron' for feishu messages.\n",
+                "- source_chat_type: %s\n"
+                "- If using cron_add to reply back in this conversation, reuse source_channel/source_chat_type/source_chat_id.\n"
+                "- Never leave chat_type or chat_id as 'cron' for non-system channels.\n",
                 msg->channel[0] ? msg->channel : "(unknown)",
-                msg->chat_id[0] ? msg->chat_id : "(empty)");
+                msg->chat_id[0] ? msg->chat_id : "(empty)",
+                msg->chat_type[0] ? msg->chat_type : "(empty)");
 
     if (n < 0 || (size_t)n >= (size - off)) {
         prompt[size - 1] = '\0';
@@ -370,16 +413,16 @@ static void append_turn_context_prompt(char *prompt, size_t size, const ec_msg_t
 static void agent_loop_task(void *arg)
 {
     esp_err_t err = ESP_OK;
-    bool sent_working_status = false;
+
     char *final_text = NULL; // 存储最终文本回复，用于发送给用户
-    char *system_prompt = (char *)malloc(EC_CONTEXT_BUF_SIZE + EC_LLM_STREAM_BUF_SIZE + EC_TOOL_OUTPUT_SIZE);
+    char *system_prompt = (char *)malloc(EC_AGENT_CONTEXT_BUF_SIZE + EC_LLM_STREAM_BUF_SIZE + EC_AGENT_TOOL_OUTPUT_SIZE);
     if (!system_prompt) {
         ESP_LOGE(TAG, "Failed to allocate agent buffers");
         vTaskDelete(NULL);
         return;
     }
 
-    char *history_json = system_prompt + EC_CONTEXT_BUF_SIZE;
+    char *history_json = system_prompt + EC_AGENT_CONTEXT_BUF_SIZE;
     char *tool_output = history_json + EC_LLM_STREAM_BUF_SIZE;
 
     // 获取所有工具的 JSON 描述，供后续 LLM 调用时使用
@@ -389,20 +432,24 @@ static void agent_loop_task(void *arg)
         // 获取入站消息，统一进行处理
         // 该消息来源于ws、飞书等适配器，或者系统适配器（定时任务触发等）
         ec_msg_t msg = {0};
-        
+        char session_key[EC_AGENT_SESSION_KEY_MAX];
+        volatile bool sent_working_status = false;
+
         if (xQueueReceive(s_inbound_queue, &msg, UINT32_MAX) != pdTRUE) {
             continue;
         }
 
-        ESP_LOGI(TAG, "Processing message from %s:%s", msg.channel, msg.chat_id);
+        ESP_LOGI(TAG, "Processing message from %s:%s:%s", msg.channel, msg.chat_id, msg.chat_type);
+        build_session_key(&msg, session_key, sizeof(session_key));
 
         // 构建系统提示词，包含基本信息和当前消息的上下文（来源渠道、chat_id等）
-        context_build_system_prompt(system_prompt, EC_CONTEXT_BUF_SIZE);
-        append_turn_context_prompt(system_prompt, EC_CONTEXT_BUF_SIZE, &msg);
-        ESP_LOGI(TAG, "LLM turn context: channel=%s chat_id=%s", msg.channel, msg.chat_id);
+        context_build_system_prompt(system_prompt, EC_AGENT_CONTEXT_BUF_SIZE);
+        append_turn_context_prompt(system_prompt, EC_AGENT_CONTEXT_BUF_SIZE, &msg);
+        ESP_LOGI(TAG, "LLM turn context: channel=%s chat_type=%s chat_id=%s",
+                 msg.channel, msg.chat_type, msg.chat_id);
 
         // 读取当前会话历史，构建消息数组供 LLM 使用
-        ec_session_get_history_json(msg.chat_id, history_json,
+        ec_session_get_history_json(session_key, history_json,
                                     EC_LLM_STREAM_BUF_SIZE, EC_AGENT_MAX_HISTORY);
         cJSON *messages = cJSON_Parse(history_json);
         if (!messages) {
@@ -416,10 +463,11 @@ static void agent_loop_task(void *arg)
         // 进入 ReAct 循环，最多迭代 EC_AGENT_MAX_TOOL_ITER 次
         for (size_t i = 0; i < EC_AGENT_MAX_TOOL_ITER; i++) {
 #if EC_AGENT_SEND_WORKING_STATUS
-            if (!sent_working_status && strcmp(msg.channel, EC_CHAN_SYSTEM) != 0) {
+            if (!sent_working_status && strcmp(msg.channel, g_ec_channel_system) != 0) {
                 ec_msg_t status = {0};
                 strncpy(status.channel, msg.channel, sizeof(status.channel) - 1);
                 strncpy(status.chat_id, msg.chat_id, sizeof(status.chat_id) - 1);
+                strncpy(status.chat_type, msg.chat_type, sizeof(status.chat_type) - 1);
                 status.content = strdup("\xF0\x9F\x90\xB1" "agent is working...");
                 if (status.content) {
                     if (xQueueSend(s_outbound_queue, &status, pdMS_TO_TICKS(1000)) != pdTRUE) {
@@ -456,7 +504,7 @@ static void agent_loop_task(void *arg)
             cJSON_AddItemToArray(messages, asst_msg);
 
             // 执行工具并将结果追加到消息数组中，供下一轮 LLM 调用使用
-            cJSON *tool_results = build_tool_results(&resp, &msg, tool_output, EC_TOOL_OUTPUT_SIZE);
+            cJSON *tool_results = build_tool_results(&resp, &msg, tool_output, EC_AGENT_TOOL_OUTPUT_SIZE);
             cJSON *result_msg = cJSON_CreateObject();
             cJSON_AddStringToObject(result_msg, "role", "user");
             cJSON_AddItemToObject(result_msg, "content", tool_results);
@@ -467,21 +515,22 @@ static void agent_loop_task(void *arg)
 
         if (final_text && final_text[0]) {
             // 保存用户消息和助手回复到会话历史中
-            esp_err_t save_user = ec_session_append(msg.chat_id, "user", msg.content);
-            esp_err_t save_asst = ec_session_append(msg.chat_id, "assistant", final_text);
+            esp_err_t save_user = ec_session_append(session_key, "user", msg.content);
+            esp_err_t save_asst = ec_session_append(session_key, "assistant", final_text);
             if (save_user != ESP_OK || save_asst != ESP_OK) {
-                ESP_LOGW(TAG, "Session save failed for chat %s (user=%s, assistant=%s)",
-                         msg.chat_id,
+                ESP_LOGW(TAG, "Session save failed for %s:%s:%s (user=%s, assistant=%s)",
+                         msg.channel, msg.chat_type, msg.chat_id,
                          esp_err_to_name(save_user),
                          esp_err_to_name(save_asst));
             } else {
-                ESP_LOGI(TAG, "Session saved for chat %s", msg.chat_id);
+                ESP_LOGI(TAG, "Session saved for %s:%s:%s", msg.channel, msg.chat_type, msg.chat_id);
             }
 
             // 推送消息到出站队列，发送给用户
             ec_msg_t out = {0};
             strncpy(out.channel, msg.channel, sizeof(out.channel) - 1);
             strncpy(out.chat_id, msg.chat_id, sizeof(out.chat_id) - 1);
+            strncpy(out.chat_type, msg.chat_type, sizeof(out.chat_type) - 1);
             out.content = final_text;  /* transfer ownership */
             ESP_LOGI(TAG, "Queue final response to %s:%s (%d bytes)",
                      out.channel, out.chat_id, (int)strlen(final_text));
@@ -497,6 +546,7 @@ static void agent_loop_task(void *arg)
             ec_msg_t out = {0};
             strncpy(out.channel, msg.channel, sizeof(out.channel) - 1);
             strncpy(out.chat_id, msg.chat_id, sizeof(out.chat_id) - 1);
+            strncpy(out.chat_type, msg.chat_type, sizeof(out.chat_type) - 1);
             out.content = strdup("Sorry, I encountered an error.");
             if (out.content) {
                 if (xQueueSend(s_outbound_queue, &out, pdMS_TO_TICKS(1000)) != pdTRUE) {
@@ -515,26 +565,28 @@ static void agent_loop_task(void *arg)
 
 }
 
-char *ec_agent_patch_tool_input_with_context_for_test(const char *tool_name, const char *input_json,
-                                                      const ec_msg_t *msg)
+static void channel_delivery_task(void *arg)
 {
-    ec_llm_tool_call_t call = {0};
+    (void)arg;
 
-    if (tool_name) {
-        strncpy(call.name, tool_name, sizeof(call.name) - 1);
+    while (1) {
+        ec_msg_t msg = {0};
+        esp_err_t err;
+
+        if (xQueueReceive(s_outbound_queue, &msg, UINT32_MAX) != pdTRUE) {
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Deliver outbound message to %s:%s:%s (%d bytes)",
+                 msg.channel, msg.chat_type, msg.chat_id, msg.content ? (int)strlen(msg.content) : 0);
+        err = ec_channel_send(&msg);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Send outbound to:%s failed: %s",
+                     msg.chat_id, esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG, "Outbound delivered to %s:%s:%s", msg.channel, msg.chat_type, msg.chat_id);
+        }
+
+        free(msg.content);
     }
-    call.input = (char *)(input_json ? input_json : "{}");
-    call.input_len = input_json ? strlen(input_json) : 2;
-
-    return patch_tool_input_with_context(&call, msg);
-}
-
-esp_err_t ec_agent_build_system_prompt_for_test(char *buf, size_t size)
-{
-    return context_build_system_prompt(buf, size);
-}
-
-void ec_agent_append_turn_context_for_test(char *prompt, size_t size, const ec_msg_t *msg)
-{
-    append_turn_context_prompt(prompt, size, msg);
 }

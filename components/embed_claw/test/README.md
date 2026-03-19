@@ -20,10 +20,12 @@
 - OpenAI 兼容 provider 的 JSON 转换测试
 - registry、dispatch、response free 等基础契约
 - 串口自动驱动 Unity 菜单并自动采集结果
+- GitHub Actions 对主工程和 `unit-test-app` 的编译检查
 
 当前不覆盖：
 
 - 真实 Tavily / DashScope / Feishu 联网成功路径
+- 真实 QQBot token / gateway / websocket 联网成功路径
 - WebSocket / Feishu 的 server/client 生命周期和异步任务路径
 - `ec_agent.c` 的完整 ReAct loop、tool result 回填和队列任务行为
 - `embed_claw.c` 的总启动流程与 outbound dispatch task
@@ -56,7 +58,7 @@
   - 必填字段校验
   - `at` / `every` 调度参数校验
   - `cron_add` / `cron_list` / `cron_remove`
-  - Feishu channel 额外约束
+  - 外部 channel 的 `chat_type + chat_id` 约束
 
 ### 2.2 channels
 
@@ -67,9 +69,11 @@
   - Feishu relay 消息兼容解析
   - 出站 response JSON 编码
 - [test_channel_feishu.c](/home/kirto/EmbedClaw1/components/embed_claw/test/channel/test_channel_feishu.c)
-  - chat_id 前缀解析
   - WebSocket ping frame 编码/解析
   - response frame 编码/解析
+- [test_channel_qq.c](/home/kirto/EmbedClaw1/components/embed_claw/test/channel/test_channel_qq.c)
+  - 官方 QQBot dispatch event 到 `ec_msg_t` 的映射
+  - `chat_type + chat_id` 到官方 REST path / body 的编码
 
 ### 2.3 llm
 
@@ -124,10 +128,18 @@ components/embed_claw/test/
 ├── README.md
 ├── sdkconfig.defaults
 ├── support/
-│   └── ec_test_hooks.h
+│   ├── ec_test_channel_feishu.c
+│   ├── ec_test_channel_qq.c
+│   ├── ec_test_channel_ws.c
+│   ├── ec_test_hooks.h
+│   ├── ec_test_llm_openai.c
+│   ├── ec_test_tools_files.c
+│   ├── ec_test_tools_get_time.c
+│   └── ec_test_tools_web_search.c
 ├── channel/
 │   ├── test_channel_contract.c
 │   ├── test_channel_feishu.c
+│   ├── test_channel_qq.c
 │   └── test_channel_ws.c
 ├── core/
 │   ├── test_agent_contract.c
@@ -147,16 +159,37 @@ components/embed_claw/test/
 
 ## 4. 测试 hook
 
-部分生产模块存在静态 registry、静态状态或内部 helper。为了让每条测试可独立运行，这里暴露了测试专用 hook：
+部分生产模块存在静态 registry、静态状态或内部 helper。为了让每条测试可独立运行，这里保留了少量 reset/configure hook，并通过 test-only shim 暴露需要单测的协议编解码逻辑：
 
 - [ec_test_hooks.h](/home/kirto/EmbedClaw1/components/embed_claw/test/support/ec_test_hooks.h)
 - [ec_channel.c](/home/kirto/EmbedClaw1/components/embed_claw/core/ec_channel.c)
 - [ec_tools.c](/home/kirto/EmbedClaw1/components/embed_claw/core/ec_tools.c)
 - [ec_llm.c](/home/kirto/EmbedClaw1/components/embed_claw/llm/ec_llm.c)
+- [ec_test_channel_qq.c](/home/kirto/EmbedClaw1/components/embed_claw/test/support/ec_test_channel_qq.c)
+- [ec_test_channel_ws.c](/home/kirto/EmbedClaw1/components/embed_claw/test/support/ec_test_channel_ws.c)
+- [ec_test_llm_openai.c](/home/kirto/EmbedClaw1/components/embed_claw/test/support/ec_test_llm_openai.c)
 
-这些 hook 只服务测试，不属于生产 API。
+其中：
+
+- `reset/configure` 类 hook 用来隔离静态状态和副作用
+- test-only shim 用来复用生产代码里的纯逻辑实现，而不是在测试里复制一份逻辑副本
+
+这些接口只服务测试，不属于生产 API。
 
 ## 5. 本地运行方式
+
+### 5.0 CI 行为
+
+当前 GitHub Actions workflow 是：
+
+- [embed_claw-unit-tests.yml](/home/kirto/EmbedClaw1/.github/workflows/embed_claw-unit-tests.yml)
+
+它只做两件事：
+
+- `idf.py build` 编主工程
+- `./scripts/run_unit_tests.sh build` 编 `unit-test-app`
+
+它不会在 GitHub 上执行真实硬件测试，也不会自动烧录板子。
 
 ### 5.1 前置条件
 
@@ -437,6 +470,12 @@ components/embed_claw/test/channel/test_channel_<name>.c
 
 ```text
 [embed_claw][channel][<name>]
+```
+
+例如 QQ channel 当前使用：
+
+```text
+[embed_claw][channel][qq]
 ```
 
 ### 8.3 新增 LLM provider

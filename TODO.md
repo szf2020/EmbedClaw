@@ -24,11 +24,12 @@
 - [x] WebSocket
 - [ ] MQTT
 - [x] Feishu (Lark)
-- [ ] QQ
+- [x] QQ
 - [ ] WeCom (WeChat Work)
 - [ ] DingTalk
 
 ## Other
 
+- [x] test and ci/cd
 - [ ] Support more filesystems (beyond SPIFFS)
 - [ ] SD card support

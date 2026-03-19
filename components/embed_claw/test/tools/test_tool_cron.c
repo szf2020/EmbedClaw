@@ -2,6 +2,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "memory_checks.h"
 #include "unity.h"
 
 #include "core/ec_tools.h"
@@ -9,16 +10,16 @@
 
 static void register_tools_for_cron_tests(void)
 {
-    ec_tools_reset_for_test();
-    ec_tools_cron_reset_for_test();
-    ec_tools_cron_configure_for_test(true, true);
+    ec_tools_free_json();
+
     TEST_ASSERT_EQUAL(ESP_OK, ec_tools_register_all());
+    test_utils_record_free_mem();
 }
 
 static void cleanup_tools_after_test(void)
 {
-    ec_tools_reset_for_test();
-    ec_tools_cron_reset_for_test();
+    ec_tools_free_json();
+    
 }
 
 static void extract_job_id(const char *text, char *job_id, size_t job_id_size)
@@ -51,16 +52,24 @@ TEST_CASE("cron tool validates required fields and schedule arguments", "[embed_
                                        "{\"name\":\"relay\",\"schedule_type\":\"every\",\"interval_s\":60,"
                                        "\"message\":\"ping\",\"channel\":\"feishu\"}",
                                        output, sizeof(output)));
-    TEST_ASSERT_NOT_NULL(strstr(output, "requires a valid chat_id"));
+    TEST_ASSERT_NOT_NULL(strstr(output, "require both chat_type and chat_id"));
+
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      ec_tools_execute("cron_add",
+                                       "{\"name\":\"qq relay\",\"schedule_type\":\"every\",\"interval_s\":60,"
+                                       "\"message\":\"ping\",\"channel\":\"qq\",\"chat_id\":\"GROUP123\"}",
+                                       output, sizeof(output)));
+    TEST_ASSERT_NOT_NULL(strstr(output, "require both chat_type and chat_id"));
 
     cleanup_tools_after_test();
 }
 
 TEST_CASE("cron tool can add list and remove recurring jobs", "[embed_claw][tools][cron]")
 {
-    char input[128];
-    char output[512];
+    char input[256];
+    char output[768];
     char job_id[16];
+    char relay_job_id[16];
 
     register_tools_for_cron_tests();
 
@@ -72,11 +81,26 @@ TEST_CASE("cron tool can add list and remove recurring jobs", "[embed_claw][tool
     TEST_ASSERT_NOT_NULL(strstr(output, "Added recurring job"));
     extract_job_id(output, job_id, sizeof(job_id));
 
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ec_tools_execute("cron_add",
+                                       "{\"name\":\"qq relay\",\"schedule_type\":\"every\","
+                                       "\"interval_s\":60,\"message\":\"relay\","
+                                       "\"channel\":\"qq\",\"chat_type\":\"group\",\"chat_id\":\"GROUP123\"}",
+                                       output, sizeof(output)));
+    TEST_ASSERT_NOT_NULL(strstr(output, "Added recurring job"));
+    extract_job_id(output, relay_job_id, sizeof(relay_job_id));
+
     TEST_ASSERT_EQUAL(ESP_OK, ec_tools_execute("cron_list", "{}", output, sizeof(output)));
     TEST_ASSERT_NOT_NULL(strstr(output, "heartbeat"));
+    TEST_ASSERT_NOT_NULL(strstr(output, "qq relay"));
     TEST_ASSERT_NOT_NULL(strstr(output, "system:cron"));
+    TEST_ASSERT_NOT_NULL(strstr(output, "qq:group:GROUP123"));
 
     snprintf(input, sizeof(input), "{\"job_id\":\"%s\"}", job_id);
+    TEST_ASSERT_EQUAL(ESP_OK, ec_tools_execute("cron_remove", input, output, sizeof(output)));
+    TEST_ASSERT_NOT_NULL(strstr(output, "Removed cron job"));
+
+    snprintf(input, sizeof(input), "{\"job_id\":\"%s\"}", relay_job_id);
     TEST_ASSERT_EQUAL(ESP_OK, ec_tools_execute("cron_remove", input, output, sizeof(output)));
     TEST_ASSERT_NOT_NULL(strstr(output, "Removed cron job"));
 

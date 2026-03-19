@@ -1,13 +1,15 @@
 /**
  * @file wifi_connect.cpp
  * @author cangyu (sky.kirto@qq.com)
- * @brief WiFi connection bridge (C interface over C++ wifi manager)
+ * @brief 
  * @version 0.1
- * @date 2026-03-02
- *
+ * @date 2026-03-12
+ * 
  * @copyright Copyright (c) 2026, Wireless-Tag. All rights reserved.
- *
+ * 
  */
+
+/* ==================== [Includes] ========================================== */
 
 #include "wifi_connect.h"
 
@@ -23,33 +25,21 @@
 
 #include "embedclaw_config.h"
 
+/* ==================== [Defines] =========================================== */
+
+/* ==================== [Typedefs] ========================================== */
+
+/* ==================== [Static Prototypes] ================================= */
+
+static void wifi_event_handler(WifiEvent event, const std::string &data);
+
+/* ==================== [Static Variables] ================================== */
+
 static const char *TAG = "wifi_connect";
 
-static void wifi_event_handler(WifiEvent event, const std::string &data)
-{
-    switch (event) {
-        case WifiEvent::Scanning:
-            ESP_LOGI(TAG, "Scanning for networks...");
-            break;
-        case WifiEvent::Connecting:
-            ESP_LOGI(TAG, "Connecting to network...");
-            break;
-        case WifiEvent::Connected:
-            ESP_LOGI(TAG, "Connected successfully!");
-            ESP_ERROR_CHECK(ec_embed_claw_start());
-            break;
-        case WifiEvent::Disconnected:
-            ESP_LOGW(TAG, "Disconnected from network, reason: %s", data.c_str());
-            break;
-        case WifiEvent::ConfigModeEnter:
-            ESP_LOGI(TAG, "Entered config mode");
-            break;
-        case WifiEvent::ConfigModeExit:
-            ESP_LOGI(TAG, "Exited config mode");
-            esp_restart();
-            break;
-    }
-}
+/* ==================== [Macros] ============================================ */
+
+/* ==================== [Global Functions] ================================== */
 
 extern "C" esp_err_t wifi_connect_init(void)
 {
@@ -79,4 +69,33 @@ extern "C" void wifi_connect_start(void)
     }
 
     wifi_manager.StartStation();
+}
+
+/* ==================== [Static Functions] ================================== */
+
+
+static void wifi_event_handler(WifiEvent event, const std::string &data)
+{
+    switch (event) {
+        case WifiEvent::Scanning:
+            ESP_LOGI(TAG, "Scanning for networks...");
+            break;
+        case WifiEvent::Connecting:
+            ESP_LOGI(TAG, "Connecting to network...");
+            break;
+        case WifiEvent::Connected:
+            ESP_LOGI(TAG, "Connected successfully!");
+            ESP_ERROR_CHECK(ec_embed_claw_start());
+            break;
+        case WifiEvent::Disconnected:
+            ESP_LOGW(TAG, "Disconnected from network, reason: %s", data.c_str());
+            break;
+        case WifiEvent::ConfigModeEnter:
+            ESP_LOGI(TAG, "Entered config mode");
+            break;
+        case WifiEvent::ConfigModeExit:
+            ESP_LOGI(TAG, "Exited config mode");
+            esp_restart();
+            break;
+    }
 }

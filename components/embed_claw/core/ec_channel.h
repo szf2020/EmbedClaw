@@ -14,6 +14,8 @@
 
 /* ==================== [Includes] ========================================== */
 
+#include <stdbool.h>
+
 #include "esp_err.h"
 #include "ec_agent.h"
 
@@ -22,6 +24,11 @@ extern "C" {
 #endif
 
 /* ==================== [Defines] =========================================== */
+
+#define EC_CHANNEL_NAME_EXTERN
+#include "channel/ec_channel_reg.inc"
+
+extern const char g_ec_channel_system[];
 
 /* ==================== [Typedefs] ========================================== */
 
@@ -71,7 +78,7 @@ esp_err_t ec_channel_register(const ec_channel_t *driver);
  * @return esp_err_t 
  *  - ESP_OK 启动成功
  */
-esp_err_t ec_channel_start(const char *channel);
+esp_err_t ec_channel_start(void);
 
 /**
  * @brief 发送发送信息给指定channel
@@ -81,6 +88,7 @@ esp_err_t ec_channel_start(const char *channel);
  *  - ESP_OK 消息发送成功
  */
 esp_err_t ec_channel_send(const ec_msg_t *msg);
+
 
 /* ==================== [Macros] ============================================ */
 

@@ -24,7 +24,7 @@
 #include "cJSON.h"
 /* ==================== [Defines] =========================================== */
 
-#define MAX_FILE_SIZE (32 * 1024)
+#define EC_TOOLS_FILES_MAX_FILE_SIZE (32 * 1024)
 
 /* ==================== [Typedefs] ========================================== */
 
@@ -113,8 +113,6 @@ esp_err_t ec_tools_list_dir(void)
     ec_tools_register(&s_list_dir);
     return ESP_OK;
 }
-
-
 /* ==================== [Static Functions] ================================== */
 
 static esp_err_t ec_tool_read_file_execute(const char *input_json, char *output, size_t output_size)
@@ -140,8 +138,8 @@ static esp_err_t ec_tool_read_file_execute(const char *input_json, char *output,
     }
 
     size_t max_read = output_size - 1;
-    if (max_read > MAX_FILE_SIZE) {
-        max_read = MAX_FILE_SIZE;
+    if (max_read > EC_TOOLS_FILES_MAX_FILE_SIZE) {
+        max_read = EC_TOOLS_FILES_MAX_FILE_SIZE;
     }
 
     size_t n = fread(output, 1, max_read, f);
@@ -233,7 +231,7 @@ static esp_err_t ec_tool_edit_file_execute(const char *input_json, char *output,
     long file_size = ftell(f);
     fseek(f, 0, SEEK_SET);
 
-    if (file_size <= 0 || file_size > MAX_FILE_SIZE) {
+    if (file_size <= 0 || file_size > EC_TOOLS_FILES_MAX_FILE_SIZE) {
         snprintf(output, output_size, "Error: file too large or empty (%ld bytes)", file_size);
         fclose(f);
         cJSON_Delete(root);
@@ -387,15 +385,4 @@ static esp_err_t replace_first_occurrence(const char *source, const char *old_st
     output[total_len] = '\0';
 
     return ESP_OK;
-}
-
-bool ec_tools_files_validate_path_for_test(const char *path)
-{
-    return validate_path(path);
-}
-
-esp_err_t ec_tools_files_replace_first_for_test(const char *source, const char *old_str,
-                                                const char *new_str, char *output, size_t output_size)
-{
-    return replace_first_occurrence(source, old_str, new_str, output, output_size);
 }

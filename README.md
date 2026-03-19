@@ -6,7 +6,7 @@
 
 **Decouple LLM, Tools, Agent, and Channels—then pack them onto a single ESP32-S3.**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)![ESP32-S3](https://img.shields.io/badge/MCU-ESP32--S3-ff6a00)![LLM](https://img.shields.io/badge/LLM-Qwen%20via%20DashScope-0f766e)![Channel](https://img.shields.io/badge/Channel-Feishu%20%7C%20WebSocket-2563eb)![Search](https://img.shields.io/badge/Search-Tavily-111827)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) ![ESP32-S3](https://img.shields.io/badge/MCU-ESP32--S3-ff6a00) ![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v5.5.2-00979D) ![LLM](https://img.shields.io/badge/LLM-Qwen%20via%20DashScope-0f766e) ![Channel](https://img.shields.io/badge/Channel-Feishu%20%7C%20WebSocket%20%7C%20QQBot-2563eb) ![Search](https://img.shields.io/badge/Search-Tavily-111827)
 
 </div>
 
@@ -66,7 +66,7 @@ It’s a working “embedded Agent base” you can extend.
 |--------|------------------------|--------|
 | LLM | Qwen `qwen-plus` | Via Alibaba DashScope OpenAI-compatible API |
 | Web Search | Tavily Search API | For news, weather, and real-time info |
-| Chat Channel | Feishu, WebSocket | Feishu long connection in/out; local WebSocket chat |
+| Chat Channel | Feishu, WebSocket, QQBot | Feishu long connection, local WebSocket chat, official QQBot gateway |
 | Agent | ReAct tool loop | Model can call tools, read results, then continue |
 | Long-term memory | `/spiffs/memory/MEMORY.md` | User profile, preferences, stable facts |
 | Short-term memory | `/spiffs/session/se_<hash>.jsonl` | Recent conversation for current session |
@@ -104,8 +104,10 @@ You can add more Skills as Markdown under `/spiffs/skills/*.md`; the Agent picks
 flowchart LR
     U[User] --> F[Feishu Channel]
     U --> W[WebSocket Channel]
+    U --> Qc[QQBot Channel]
     F --> A[Agent Loop]
     W --> A
+    Qc --> A
     A --> L[LLM Provider]
     L --> Q[Qwen via DashScope]
     A --> T[Tool Registry]
@@ -119,6 +121,7 @@ flowchart LR
     A --> O[Outbound Dispatcher]
     O --> F
     O --> W
+    O --> Qc
 ```
 
 ## Directory layout
@@ -130,11 +133,11 @@ flowchart LR
 │   ├── core/                     # Agent, Memory, Session, Skill Loader, Tool Registry
 │   ├── llm/                      # LLM provider abstraction and implementations
 │   ├── tools/                    # Tool implementations
-│   ├── channel/                 # Feishu / WebSocket channels
+│   ├── channel/                 # Feishu / WebSocket / QQBot channels
 │   ├── embed_claw.c             # System startup entry
 │   └── ec_config_internal.h     # Built-in defaults; local overrides live in main/ec_config.h
 ├── spiffs_data/                 # Default SPIFFS image content
-└── scripts/                     # WebSocket test and Feishu relay scripts
+└── scripts/                     # WebSocket test script and test-app helpers
 ```
 
 ## Runtime flow
@@ -182,6 +185,7 @@ You’ll need:
 - **PSRAM** (enabled by default in this project)
 - USB cable
 - **ESP-IDF 5.x** installed
+- **Recommended version: ESP-IDF v5.5.2** (current validated baseline)
 
 The default target is `esp32s3`. The build packs `spiffs_data/` with `spiffs_create_partition_image`.
 
@@ -210,9 +214,24 @@ Default LLM URL (DashScope OpenAI-compatible):
 
 If you skip Tavily or Feishu for now, you only need the Qwen-related keys.
 
+Optional channel toggles:
+
+```c
+#define EC_FEISHU_ENABLE 0
+#define EC_QQ_ENABLE     1
+#define EC_QQ_APP_ID     "YOUR_QQ_APP_ID"
+#define EC_QQ_CLIENT_SECRET "YOUR_QQ_CLIENT_SECRET"
+```
+
+QQ uses the official QQBot route in this repo: `AppID + ClientSecret -> access_token -> /gateway -> websocket`.
+The device acts as a WebSocket client, so the device itself does not need a public IP.
+
 ### 2. Build
 
+Before building, copy the `esp32s3` defaults into `sdkconfig.defaults` so `menuconfig` starts from the repository's intended `esp32s3` baseline:
+
 ```bash
+cp sdkconfig.defaults.esp32s3 sdkconfig.defaults
 idf.py set-target esp32s3
 idf.py build
 ```
@@ -312,7 +331,8 @@ To simulate Feishu from a relay:
   "type": "message",
   "content": "Set a reminder for 8am tomorrow",
   "channel": "feishu",
-  "chat_id": "open_id:ou_xxx"
+  "chat_type": "open_id",
+  "chat_id": "ou_xxx"
 }
 ```
 
@@ -324,9 +344,12 @@ Device response:
 {
   "type": "response",
   "content": "Here’s today’s tech news summary.",
-  "chat_id": "my-debug-session"
+  "chat_id": "my-debug-session",
+  "chat_type": "ws"
 }
 ```
+
+`chat_type` is included in outbound responses and follows the current session/inbound routing context.
 
 ## Feishu (Lark) integration
 
@@ -379,10 +402,10 @@ Once the device is online, the Feishu channel starts and connects to Feishu.
 - DM the bot, or
 - Add the bot to a group and chat there.
 
-Reply target is chosen automatically:
+Reply target is chosen automatically with split routing fields:
 
-- DMs: `open_id:<id>`
-- Groups: `chat_id:<id>`
+- DMs: `chat_type="open_id"`, `chat_id="<open_id>"`
+- Groups: `chat_type="chat_id"`, `chat_id="<chat_id>"`
 
 ### Optional: PC relay script
 
@@ -393,6 +416,67 @@ The repo includes [`scripts/feishu_relay.py`](scripts/feishu_relay.py) for:
 - Debugging Feishu and the device Agent separately
 
 For normal use, the built-in Feishu long-connection implementation is recommended.
+
+## QQBot integration
+
+EmbedClaw also includes an official QQBot channel. This implementation follows the same route as the OpenClaw QQBot plugin instead of a OneBot bridge.
+
+### What the QQ channel does
+
+1. Uses `EC_QQ_APP_ID` and `EC_QQ_CLIENT_SECRET`
+2. Calls `https://bots.qq.com/app/getAppAccessToken`
+3. Calls `https://api.sgroup.qq.com/gateway`
+4. Connects to the QQ gateway over WebSocket
+5. Sends `IDENTIFY`, keeps heartbeat, and handles dispatch events
+6. Sends replies back over QQ official REST APIs
+
+### Supported inbound events
+
+- `C2C_MESSAGE_CREATE`
+- `GROUP_AT_MESSAGE_CREATE`
+- `AT_MESSAGE_CREATE`
+
+These map to routing fields inside EmbedClaw:
+
+- C2C: `chat_type="c2c"`, `chat_id="<openid>"`
+- Group: `chat_type="group"`, `chat_id="<group_openid>"`
+- Channel: `chat_type="channel"`, `chat_id="<channel_id>"`
+
+### Minimal config
+
+Add to [`main/ec_config.h`](main/ec_config.h):
+
+```c
+#define EC_QQ_ENABLE        1
+#define EC_QQ_APP_ID        "YOUR_QQ_APP_ID"
+#define EC_QQ_CLIENT_SECRET "YOUR_QQ_CLIENT_SECRET"
+```
+
+Optional:
+
+```c
+#define EC_QQ_INTENTS       (1 << 25)
+#define EC_QQ_RECONNECT_MS  10000
+```
+
+### Notes
+
+- The current implementation focuses on text messages first.
+- The device does not expose a Webhook endpoint.
+- If QQ is enabled but the credentials are invalid, startup logs will show the token/gateway failure path.
+
+See the official entry page: <https://q.qq.com/qqbot/openclaw/index.html>
+
+## Testing
+
+There are two test layers in this repo:
+
+- Firmware build check: `idf.py build`
+- `embed_claw` unit-test-app build: `./scripts/run_unit_tests.sh build`
+
+Detailed board-side test instructions live in [`components/embed_claw/test/README.md`](components/embed_claw/test/README.md).
+
+GitHub Actions currently does compile-only checks on both the project firmware and the `unit-test-app`. It does not run hardware-attached tests in CI.
 
 ## Persona and memory
 
@@ -479,8 +563,9 @@ When the user asks for translation.
 1. Add `ec_channel_xxx.c` under `components/embed_claw/channel/`
 2. Implement `start()` and `send()`
 3. Convert incoming messages to `ec_msg_t` and call `ec_agent_inbound()`
-4. On outbound, route by `msg->chat_id`
-5. Register with `EC_CHANNEL_REG(xxx)` in `ec_channel_reg.inc`
+4. On outbound, route by `msg->channel` to select the channel driver
+5. In each channel `send()`, use `msg->chat_type` + `msg->chat_id` to resolve the destination
+6. Register with `EC_CHANNEL_REG(xxx)` in `ec_channel_reg.inc`
 
 Minimal skeleton:
 
@@ -506,7 +591,7 @@ esp_err_t ec_channel_demo(void)
 
 Currently used:
 
-- **LLM_TYPE_OPENAI**
+- `EC_LLM_PROVIDER_NAME` (default: `openai`)
 - DashScope OpenAI-compatible API
 - **qwen-plus**
 
@@ -514,15 +599,16 @@ To add another provider:
 
 1. See `components/embed_claw/llm/ec_llm_internal.h`
 2. Add `ec_llm_xxx.c` / `.h`
-3. Implement `init` and `chat_tools`
-4. Map the provider’s response to `ec_llm_response_t`
-5. Wire the new type in `ec_llm.c` and select it at startup
+3. Export `ec_llm_xxx_get_provider(void)` from the new provider module
+4. Implement `init` and `chat_tools`, and map the response to `ec_llm_response_t`
+5. Add one branch in `ec_llm_init_default()` (`components/embed_claw/llm/ec_llm.c`) to map provider name to getter
+6. Set `EC_LLM_PROVIDER_NAME` in `main/ec_config.h` (and set matching URL/model)
 
-The repo already has a stub for Anthropic; the working path is OpenAI-compatible (OpenAI, DeepSeek, Moonshot, Qwen, etc.).
+The current runtime path is OpenAI-compatible providers (OpenAI, DeepSeek, Moonshot, Qwen, etc.). Other provider families are not wired yet.
 
 ## Possible next steps
 
-With clear boundaries, natural extensions include:[TODE.md](TODO.md)
+With clear boundaries, natural extensions include: [TODO.md](TODO.md)
 
 ## Notes
 
@@ -533,6 +619,7 @@ For open-source distribution, repo defaults keep secret fields empty. Put real k
 Before running, set:
 
 - DashScope / Qwen API key  
+- `EC_LLM_PROVIDER_NAME` (default is `openai`)
 - Tavily API key  
 - Feishu App ID and App Secret  
 

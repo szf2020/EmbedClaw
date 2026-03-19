@@ -23,10 +23,10 @@
 
 /* ==================== [Defines] =========================================== */
 
-#define LLM_API_KEY_MAX_LEN 320
-#define LLM_MODEL_MAX_LEN   64
-#define LLM_DUMP_MAX_BYTES   (16 * 1024)
-#define LLM_DUMP_CHUNK_BYTES 320
+#define EC_LLM_OPENAI_API_KEY_MAX_LEN 320
+#define EC_LLM_OPENAI_MODEL_MAX_LEN   64
+#define EC_LLM_OPENAI_DUMP_MAX_BYTES   (16 * 1024)
+#define EC_LLM_OPENAI_DUMP_CHUNK_BYTES 320
 
 /* ==================== [Typedefs] ========================================== */
 
@@ -88,13 +88,12 @@ static const ec_llm_provider_vtable_t ec_llm_openai_vtable = {
 /* ==================== [Macros] ============================================ */
 
 /* ==================== [Global Functions] ================================== */
-
 ec_llm_provider_t  *ec_llm_openai_get_provider(void)
 {
-    s_provider.name = "openai";
     s_provider.instance.url = NULL;
     s_provider.instance.api_key = NULL;
     s_provider.instance.model = NULL;
+    s_provider.name = "openai";
     s_provider.vtable = &ec_llm_openai_vtable;
 
     return &s_provider;
@@ -285,7 +284,7 @@ static esp_err_t ec_llm_openai_chat_tools(ec_llm_provider_t *self, const char *s
             if (tool_calls && cJSON_IsArray(tool_calls)) {
                 cJSON *tc;
                 cJSON_ArrayForEach(tc, tool_calls) {
-                    if (resp->call_count >= EC_MAX_TOOL_CALLS) {
+                    if (resp->call_count >= EC_LLM_MAX_TOOL_CALLS) {
                         break;
                     }
                     ec_llm_tool_call_t *call = &resp->calls[resp->call_count];
@@ -556,7 +555,7 @@ static esp_err_t llm_http(const char *post_data, resp_buf_t *rb, int *out_status
     esp_http_client_set_method(client, HTTP_METHOD_POST);
     esp_http_client_set_header(client, "Content-Type", "application/json; charset=utf-8");
 
-    char auth[LLM_API_KEY_MAX_LEN + 16];
+    char auth[EC_LLM_OPENAI_API_KEY_MAX_LEN + 16];
     snprintf(auth, sizeof(auth), "Bearer %s", s_provider.instance.api_key);
     esp_http_client_set_header(client, "Authorization", auth);
 
@@ -581,19 +580,4 @@ static const char *select_server_ca_pem(const char *url)
     }
 
     return NULL;
-}
-
-cJSON *ec_llm_openai_convert_tools_for_test(const char *tools_json)
-{
-    return convert_tools_openai(tools_json);
-}
-
-cJSON *ec_llm_openai_convert_messages_for_test(const char *system_prompt, cJSON *messages)
-{
-    return convert_messages_openai(system_prompt, messages);
-}
-
-const char *ec_llm_openai_select_server_ca_pem_for_test(const char *url)
-{
-    return select_server_ca_pem(url);
 }
