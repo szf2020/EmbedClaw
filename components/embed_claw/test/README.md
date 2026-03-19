@@ -124,6 +124,7 @@
 ```text
 components/embed_claw/test/
 ├── CMakeLists.txt
+├── ec_test_config.h
 ├── partitions.csv
 ├── README.md
 ├── sdkconfig.defaults
@@ -208,6 +209,13 @@ components/embed_claw/test/
 
 需要注意：
 
+- `ec_test_config.h`
+  - 仓库内可提交的测试默认配置
+  - 供 CI 和干净 checkout 的 `unit-test-app` 构建直接使用
+  - 当前会提供最小 QQ dummy 配置，保证 QQ 相关测试编译路径始终可用
+- `ec_config.h`
+  - 本地私有、可选覆盖，默认不提交
+  - 如果存在，会先于 `ec_test_config.h` 注入；`ec_test_config.h` 只补齐未定义的测试宏
 - `sdkconfig.defaults`
   - 保留测试镜像自己的关键配置，当前显式关闭了 `PSRAM`，避免 `unit-test-app` 在 heap poisoning 下把临时分配落到 PSRAM，导致无关的堆损坏噪声
 - `partitions.csv`

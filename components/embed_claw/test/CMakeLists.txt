@@ -15,16 +15,23 @@ idf_component_register(
         embed_claw
 )
 
-set(EC_TEST_CONFIG_HEADER "${CMAKE_CURRENT_LIST_DIR}/ec_config.h")
-if(EXISTS "${EC_TEST_CONFIG_HEADER}")
-    target_compile_options(${COMPONENT_LIB} PRIVATE
-        "-include"
-        "${EC_TEST_CONFIG_HEADER}"
-    )
+set(EC_TEST_DEFAULT_CONFIG_HEADER "${CMAKE_CURRENT_LIST_DIR}/ec_test_config.h")
+set(EC_TEST_LOCAL_CONFIG_HEADER "${CMAKE_CURRENT_LIST_DIR}/ec_config.h")
 
-    idf_component_get_property(embed_claw_lib embed_claw COMPONENT_LIB)
-    target_compile_options(${embed_claw_lib} PRIVATE
-        "-include"
-        "${EC_TEST_CONFIG_HEADER}"
-    )
+if(NOT EXISTS "${EC_TEST_DEFAULT_CONFIG_HEADER}")
+    message(FATAL_ERROR "Missing tracked test config header: ${EC_TEST_DEFAULT_CONFIG_HEADER}")
 endif()
+
+idf_component_get_property(embed_claw_lib embed_claw COMPONENT_LIB)
+
+foreach(test_target ${COMPONENT_LIB} ${embed_claw_lib})
+    if(EXISTS "${EC_TEST_LOCAL_CONFIG_HEADER}")
+        target_compile_options(${test_target} PRIVATE
+            "SHELL:-include ${EC_TEST_LOCAL_CONFIG_HEADER}"
+        )
+    endif()
+
+    target_compile_options(${test_target} PRIVATE
+        "SHELL:-include ${EC_TEST_DEFAULT_CONFIG_HEADER}"
+    )
+endforeach()
